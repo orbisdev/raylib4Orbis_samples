@@ -23,7 +23,10 @@
 #include <fcntl.h>
 #include <orbisNfs.h>
 #include <sqlite3.h>
-#include <raylib.h>	
+#include <raylib.h>
+#include <spine/spine.h>
+#include <rayspine.h>
+#include <spine/extension.h>
 extern size_t _orbisNfs_lastopenFile_size;
 #define ATTR_ORBIS_WIDTH 1920 
 #define ATTR_ORBIS_HEIGHT 1080
@@ -31,6 +34,121 @@ bool flag=true;
 OrbisPadConfig *confPad;
 bool l1flag=false;
 bool r1flag=false;
+
+
+spAtlas* atlas = NULL;
+spSkeletonJson* json;
+spSkeletonData* skeletonData;
+spSkeleton* skeleton;
+spAnimationStateData* animationStateData;
+spAnimationState* animationState;
+Vector3 skeletonPosition = { 1920 / 2, 1080 / 2+125, 0};
+int x=-62;
+int y=132;
+typedef enum 
+{
+	IDLE,
+	WALK,
+	RUN, 
+	JUMP, 
+	DEATH, 
+	FALL
+}State;
+int playerStatus=IDLE;
+int playerStatusPrev=IDLE;
+int playerStatusChange=0;
+
+typedef struct MapAnimTime
+{
+	spAnimation *animation;
+	float time;
+}MapAnimTime;
+
+typedef struct StateView
+{
+	spAnimation *animation;
+	bool loop;
+	// Controls the start frame when changing from another animation to this animation.
+	MapAnimTime startTimes[2];
+	float defaultStartTime;
+}StateView;
+typedef struct Assets
+{
+	spAtlas *playerAtlas;
+	spAtlas *enemyAtlas;
+	//TextureRegion *bulletRegion, *hitRegion, *crosshair;
+	//TextureRegion *titleRegion, *gameOverRegion, *youLoseRegion, *youWinRegion, *startRegion;
+
+	spSkeletonData *playerSkeletonData;
+	spSkeletonData *enemySkeletonData;
+	spAnimationStateData *playerAnimationData;
+	spAnimationStateData *enemyAnimationData;
+	MapAnimTime startTimes[2];
+
+	StateView playerStates[6];
+	StateView enemyStates[5];
+}Assets;
+typedef struct PlayerView
+{
+	//View view;
+	//Model model;
+	spSkeleton *skeleton;
+	spAnimationState *animationState;
+	spEventData *footstepEvent;
+	//Player player;
+	spBone *rearUpperArmBone; 
+	spBone *rearBracerBone;
+	spBone *gunBone;
+	spBone *headBone;
+	spBone *torsoBone; 
+	spBone *frontUpperArmBone;
+	spAnimation *shootAnimation;
+	spAnimation *hitAnimation;
+	bool canShoot;
+	float burstShots;
+	float burstTimer;
+	Vector2 temp1;
+	Vector2 temp2;
+}PlayerView;
+
+Assets assets;
+PlayerView playerView;
+char * getAnimation(int status)
+{
+
+	switch(status)
+	{
+		case 0:
+			return "idle";
+		case 1:
+			return "walk";
+		case 2:
+			return "run";
+		case 3:
+			return "jump";
+		case 4:
+			return "death";
+		case 5: 
+			return "fall";
+		default:
+			return NULL;
+	}
+}
+
+void updatePlayerStatus(int status)
+{
+	if(playerStatus==status)
+	{
+		playerStatusChange=0;
+	}
+	else
+	{
+		TraceLog(LOG_INFO,"player status change from %d to %d",playerStatus,status);
+		playerStatusChange=1;
+		playerStatusPrev=playerStatus;
+		playerStatus=status;
+	}
+}
 
 void updateController()
 {
@@ -158,6 +276,69 @@ unsigned char * nfsGetFileContent(char *path,int *size)
 	*size=_orbisNfs_lastopenFile_size;
 	return fileContent;
 }
+void setupState(StateView *map, State state, spSkeletonData *skeletonData, const char* name, bool loop)
+{
+	map[state].animation = spSkeletonData_findAnimation(skeletonData,name);
+	map[state].loop = loop;
+	return;
+}
+void loadAssets(Assets *this)
+{
+	this->playerAtlas = spAtlas_createFromFile("/data/raylib/assets/spineboy/spineboy-pma.atlas",0);
+	spSkeletonJson *json = spSkeletonJson_create(this->playerAtlas);
+
+	//json->scale=(this->player->height /this->player->heightSource);
+	this->playerSkeletonData = spSkeletonJson_readSkeletonDataFile(json,"/data/raylib/assets/spineboy/spineboy-ess.json");
+	if (!this->playerSkeletonData)
+	{
+	    debugNetPrintf(DEBUGNET_ERROR,"%s %s\n",__FUNCTION__,json->error);
+	    spSkeletonJson_dispose(json);
+	}
+
+	this->playerAnimationData = spAnimationStateData_create(this->playerSkeletonData);
+	this->playerAnimationData->defaultMix=(0.2f);
+	spAnimationStateData_setMixByName(this->playerAnimationData,"idle", "run", 0.3f);
+	spAnimationStateData_setMixByName(this->playerAnimationData,"run", "idle", 0.1f);
+	spAnimationStateData_setMixByName(this->playerAnimationData,"shoot", "shoot", 0);
+
+	
+
+	setupState(this->playerStates, DEATH, this->playerSkeletonData, "death", false);
+
+	setupState(this->playerStates, IDLE, this->playerSkeletonData, "idle", true);
+	setupState(this->playerStates, JUMP, this->playerSkeletonData, "jump", false);
+	setupState(this->playerStates, RUN, this->playerSkeletonData, "run", true);
+	
+	if(this->playerStates[IDLE].animation != NULL)
+	{
+		this->playerStates[RUN].startTimes[0].animation=this->playerStates[IDLE].animation;
+		this->playerStates[RUN].startTimes[0].time=8 * 60;
+	}
+
+	if(this->playerStates[JUMP].animation != NULL)
+	{
+		this->playerStates[RUN].startTimes[1].animation=this->playerStates[JUMP].animation;
+		this->playerStates[RUN].startTimes[1].time=22 * 60;
+	}
+	setupState(this->playerStates, FALL, this->playerSkeletonData, "jump", false);
+	this->playerStates[FALL].defaultStartTime=22*60;
+}
+void _spAtlasPage_createTexture(spAtlasPage *self, const char *path)
+{
+	Texture2D *t=SpineCreateTexture2d((char *) path);
+	self->rendererObject=t;
+	self->width=t->width;
+	self->height=t->height;
+}
+char *_spUtil_readFile(const char *path, int *length) {
+    return _spReadFile(path, length);
+}
+
+void _spAtlasPage_disposeTexture(spAtlasPage *self) {
+    if (self->rendererObject == NULL) return;
+    Texture2D *t2d = self->rendererObject;
+    UnloadTexture(*t2d);
+}
 int main(int argc, char *argv[])
 {
 	flag=initApp();
@@ -187,6 +368,15 @@ int main(int argc, char *argv[])
 	Vector3 mapPosition = { -16.0f, 0.0f, -8.0f };          // Set model position
 	UnloadImage(image);     // Unload cubesmap image from RAM, already uploaded to VRAM
 	SetCameraMode(camera, CAMERA_ORBITAL);  // Set an orbital camera mode
+	debugNetPrintf(DEBUGNET_INFO,"[SPINE] loading assets");
+	debugNetPrintf(DEBUGNET_INFO,"[SPINE] loading assets");
+	debugNetPrintf(DEBUGNET_INFO,"[SPINE] loading assets");
+	debugNetPrintf(DEBUGNET_INFO,"[SPINE] loading assets");
+	debugNetPrintf(DEBUGNET_INFO,"[SPINE] loading assets");
+	debugNetPrintf(DEBUGNET_INFO,"[SPINE] loading assets");
+	debugNetPrintf(DEBUGNET_INFO,"[SPINE] loading assets");
+	
+	loadAssets(&assets);
 
 	SetTargetFPS(60);
 
